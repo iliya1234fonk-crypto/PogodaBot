@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Погода</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --text: var(--tg-theme-text-color, #f5f5f5);
+    --hint: var(--tg-theme-hint-color, #8d9ba8);
+    --card: var(--tg-theme-secondary-bg-color, #232e3c);
+    --accent: var(--tg-theme-button-color, #3390ec);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px; min-height: 100vh;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 22px; margin: 4px 0 14px; }
+  .row { display: flex; gap: 8px; margin-bottom: 10px; }
+  input {
+    flex: 1; min-width: 0; padding: 12px; border: none; border-radius: 12px;
+    background: var(--card); color: var(--text); font-size: 16px; outline: none;
+  }
+  button {
+    padding: 12px; border: none; border-radius: 12px; font-size: 15px;
+    background: var(--accent); color: var(--accent-text); cursor: pointer; white-space: nowrap;
+  }
+  button.ghost { background: var(--card); color: var(--text); }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .chip { padding: 7px 12px; border-radius: 16px; background: var(--card); font-size: 14px; cursor: pointer; }
+  .card { background: var(--card); border-radius: 16px; padding: 16px; margin-bottom: 12px; }
+  .city { font-size: 17px; font-weight: 600; }
+  .temp { font-size: 56px; font-weight: 700; margin: 6px 0 2px; }
+  .desc, .dsc { color: var(--hint); font-size: 15px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+  .metric { background: var(--bg); border-radius: 12px; padding: 10px; font-size: 13px; color: var(--hint); }
+  .metric b { display: block; font-size: 17px; color: var(--text); margin-top: 3px; }
+  .advice { margin-top: 12px; font-size: 15px; }
+  .day {
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    padding: 9px 0; border-bottom: 1px solid var(--bg); font-size: 15px;
+  }
+  .day:last-child { border-bottom: none; }
+  .day .dsc { flex: 1; text-align: right; font-size: 13px; }
+  .empty { color: var(--hint); text-align: center; margin-top: 40px; font-size: 15px; }
+  .err { color: #ff6b6b; font-size: 14px; min-height: 18px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<h1>🌤 Погода</h1>
+
+<div class="row">
+  <input id="q" type="text" placeholder="Город, например Москва" enterkeyhint="search" autocomplete="off">
+  <button id="go">Найти</button>
+</div>
+<div class="row">
+  <button class="ghost" id="geo">📍 Моё место</button>
+  <button class="ghost" id="unit">°C</button>
+  <button class="ghost" id="fav">☆ В избранное</button>
+</div>
+<div id="favs" class="chips"></div>
+<div id="err" class="err"></div>
+<div id="out"><div class="empty">Введи город или нажми «Моё место»</div></div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+
+const WMO = {
+  0: "ясно", 1: "преимущественно ясно", 2: "переменная облачность", 3: "пасмурно",
+  45: "туман", 48: "изморозь, туман", 51: "слабая морось", 53: "морось", 55: "сильная морось",
+  56: "ледяная морось", 57: "сильная ледяная морось", 61: "слабый дождь", 63: "дождь",
+  65: "сильный дождь", 66: "ледяной дождь", 67: "сильный ледяной дождь", 71: "слабый снег",
+  73: "снег", 75: "сильный снег", 77: "снежная крупа", 80: "слабые ливни", 81: "ливни",
+  82: "сильные ливни", 85: "слабый снегопад", 86: "сильный снегопад", 95: "гроза",
+  96: "гроза с градом", 99: "сильная гроза с градом"
+};
+
+const state = {
+  units: localStorage.getItem("units") || "metric",
+  favs: JSON.parse(localStorage.getItem("favs") || "[]"),
+  place: null,
+  data: null
+};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const tempUnit = () => (state.units === "metric" ? "°C" : "°F");
+const windUnit = () => (state.units === "metric" ? "м/с" : "миль/ч");
+const haptic = () => { try { tg.HapticFeedback.impactOccurred("light"); } catch (e) {} };
+const setError = (msg) => { $("err").textContent = msg || ""; };
+
+function advice(c) {
+  if (c < -10) return "Очень холодно: пуховик, шапка, перчатки.";
+  if (c < 0) return "Мороз: тёплая куртка, шапка и шарф.";
+  if (c < 10) return "Прохладно: куртка или свитер.";
+  if (c < 20) return "Комфортно: лёгкая куртка или кофта.";
+  if (c < 28) return "Тепло: футболка и лёгкие брюки или платье.";
+  return "Жарко: лёгкая одежда, не забывай пить воду.";
+}
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+async function findPlace(query) {
+  const url = "https://geocoding-api.open-meteo.com/v1/search?" +
+    new URLSearchParams({ name: query, count: 1, language: "ru" });
+  const data = await getJSON(url);
+  const r = data.results && data.results[0];
+  if (!r) return null;
+  return { label: r.name + (r.country ? ", " + r.country : ""), lat: r.latitude, lon: r.longitude };
+}
+
+async function loadWeather(place) {
+  const metric = state.units === "metric";
+  const url = "https://api.open-meteo.com/v1/forecast?" + new URLSearchParams({
+    latitude: place.lat,
+    longitude: place.lon,
+    timezone: "auto",
+    temperature_unit: metric ? "celsius" : "fahrenheit",
+    wind_speed_unit: metric ? "ms" : "mph",
+    current: "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code",
+    daily: "temperature_2m_max,temperature_2m_min,weather_code",
+    forecast_days: 3
+  });
+  return getJSON(url);
+}
+
+function render() {
+  const place = state.place;
+  const data = state.data;
+  const c = data.current;
+  const d = data.daily;
+  const feels = c.apparent_temperature;
+  const feelsC = state.units === "metric" ? feels : (feels - 32) * 5 / 9;
+  const days = d.time.map((day, i) => `
+    <div class="day">
+      <span>${day.slice(8, 10)}.${day.slice(5, 7)}</span>
+      <span>${Math.round(d.temperature_2m_min[i])}…${Math.round(d.temperature_2m_max[i])}${tempUnit()}</span>
+      <span class="dsc">${WMO[d.weather_code[i]] || ""}</span>
+    </div>`).join("");
+  $("out").innerHTML = `
+    <div class="card">
+      <div class="city">${esc(place.label)}</div>
+      <div class="temp">${Math.round(c.temperature_2m)}${tempUnit()}</div>
+      <div class="desc">${cap(WMO[c.weather_code] || "нет данных")}, ощущается как ${Math.round(feels)}${tempUnit()}</div>
+      <div class="grid">
+        <div class="metric">Влажность<b>${c.relative_humidity_2m}%</b></div>
+        <div class="metric">Ветер<b>${c.wind_speed_10m} ${windUnit()}</b></div>
+      </div>
+      <div class="advice">👕 ${advice(feelsC)}</div>
+    </div>
+    <div class="card">
+      <div class="city">Прогноз на 3 дня</div>
+      ${days}
+    </div>`;
+  updateFavButton();
+}
+
+async function show(place) {
+  setError("");
+  state.place = place;
+  $("out").innerHTML = '<div class="empty">Загружаем погоду…</div>';
+  try {
+    state.data = await loadWeather(place);
+    render();
+  } catch (e) {
+    state.data = null;
+    $("out").innerHTML = "";
+    setError("Сервис погоды сейчас недоступен. Попробуй позже.");
+  }
+}
+
+async function search() {
+  const q = $("q").value.trim();
+  if (!q) return;
+  haptic();
+  setError("");
+  $("out").innerHTML = '<div class="empty">Ищем город…</div>';
+  try {
+    const place = await findPlace(q);
+    if (!place) {
+      $("out").innerHTML = "";
+      setError("Город не найден. Попробуй по-английски: Moscow, Kazan.");
+      return;
+    }
+    await show(place);
+  } catch (e) {
+    $("out").innerHTML = "";
+    setError("Нет связи с сервисом погоды. Попробуй позже.");
+  }
+}
+
+function useLocation() {
+  haptic();
+  setError("");
+  if (!navigator.geolocation) {
+    setError("Геопозиция недоступна. Введи город вручную.");
+    return;
+  }
+  $("out").innerHTML = '<div class="empty">Определяем место…</div>';
+  navigator.geolocation.getCurrentPosition(
+    (pos) => show({ label: "Твоё местоположение", lat: pos.coords.latitude, lon: pos.coords.longitude }),
+    () => { $("out").innerHTML = ""; setError("Нет доступа к геопозиции. Введи город вручную."); },
+    { timeout: 10000 }
+  );
+}
+
+function toggleUnits() {
+  haptic();
+  state.units = state.units === "metric" ? "imperial" : "metric";
+  localStorage.setItem("units", state.units);
+  $("unit").textContent = tempUnit();
+  if (state.place) show(state.place);
+}
+
+function isFav(place) {
+  return !!place && state.favs.some((f) => f.label === place.label);
+}
+
+function updateFavButton() {
+  $("fav").textContent = isFav(state.place) ? "★ В избранном" : "☆ В избранное";
+}
+
+function renderFavs() {
+  $("favs").innerHTML = state.favs
+    .map((f, i) => `<span class="chip" data-i="${i}">${esc(f.label)}</span>`).join("");
+}
+
+function toggleFav() {
+  if (!state.place) return;
+  haptic();
+  if (isFav(state.place)) {
+    state.favs = state.favs.filter((f) => f.label !== state.place.label);
+  } else {
+    if (state.favs.length >= 10) { setError("Максимум 10 избранных городов."); return; }
+    state.favs.push({ label: state.place.label, lat: state.place.lat, lon: state.place.lon });
+  }
+  localStorage.setItem("favs", JSON.stringify(state.favs));
+  renderFavs();
+  updateFavButton();
+}
+
+$("go").addEventListener("click", search);
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+$("geo").addEventListener("click", useLocation);
+$("unit").addEventListener("click", toggleUnits);
+$("fav").addEventListener("click", toggleFav);
+$("favs").addEventListener("click", (e) => {
+  const chip = e.target.closest(".chip");
+  if (!chip) return;
+  haptic();
+  show(state.favs[Number(chip.dataset.i)]);
+});
+
+$("unit").textContent = tempUnit();
+renderFavs();
+updateFavButton();
+</script>
+</body>
+</html>
